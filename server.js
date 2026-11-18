@@ -151,6 +151,56 @@ app.get("/", (req, res) => {
   });
 });
 
+const express = require("express");
+const { request } = require("undici");
+const path = require("path");
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.use(express.static(path.join(__dirname, "public")));
+
+const BLOCKED_HOSTS = new Set([
+  "localhost",
+  "127.0.0.1",
+  "0.0.0.0",
+  "::1"
+]);
+
+function isSafeTarget(target) {
+  try {
+    const url = new URL(target);
+
+    if (!["http:", "https:"].includes(url.protocol)) {
+      return false;
+    }
+
+    if (BLOCKED_HOSTS.has(url.hostname.toLowerCase())) {
+      return false;
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function rewriteUrl(url, base) {
+  try {
+    return new URL(url, base).href;
+  } catch {
+    return url;
+  }
+}
+
+app.get("/", (req, res) => {
+  res.json({
+    name: "Zenith Proxy",
+    status: "online",
+    version: "2.0.0"
+  });
+});
+
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
@@ -167,51 +217,137 @@ app.get("/proxy", async (req, res) => {
     });
   }
 
-  if (!isAllowed(target)) {
-    return res.status(403).json({
-      error: "This domain is not allowed by the Zenith proxy."
+  if (!isSafeTarget(target)) {
+    return res.status(400).json({
+      error: "Invalid target URL"
     });
   }
 
   try {
-    const response = await request(target, {
+    const upstream = await request(target, {
       method: "GET",
 
       headers: {
         "user-agent":
           "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/156 Safari/537.36",
+
         "accept":
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "accept-language": "en-US,en;q=0.9"
+          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+
+        "accept-language": "en-US,en;q=0.9",
+
+        "accept-encoding": "identity"
       },
 
       maxRedirections: 5,
 
-      headersTimeout: 10000,
-      bodyTimeout: 30000
+      headersTimeout: 15000,
+      bodyTimeout: 60000
     });
 
-    res.status(response.statusCode);
+    res.status(upstream.statusCode);
 
-    const contentType = response.headers["content-type"];
+    const headers = upstream.headers;
 
-    if (contentType) {
-      res.setHeader("content-type", contentType);
+    /*
+     * Forward useful response headers.
+     */
+    const allowedHeaders = [
+      "content-type",
+      "content-length",
+      "content-encoding",
+      "last-modified",
+      "etag",
+      "cache-control",
+      "expires",
+      "date"
+    ];
+
+    for (const header of allowedHeaders) {
+      if (headers[header]) {
+        res.setHeader(header, headers[header]);
+      }
     }
 
-    // Don't let the upstream connection hang around unnecessarily.
-    res.setHeader("cache-control", "no-store");
+    /*
+     * Prevent the browser from trying to download pages
+     * because of upstream headers.
+     */
+    res.removeHeader("content-security-policy");
+    res.removeHeader("content-security-policy-report-only");
+    res.removeHeader("x-frame-options");
 
-    // Stream the response directly to the browser.
-    // This is much faster than buffering the entire page.
-    response.body.pipe(res);
+    const contentType = String(headers["content-type"] || "");
+
+    /*
+     * HTML gets streamed through directly.
+     *
+     * Images, CSS, JS, fonts, video, etc. are also streamed
+     * without buffering the entire response in memory.
+     */
+    if (
+      contentType.includes("text/html") ||
+      contentType.includes("application/xhtml+xml")
+    ) {
+      let body = "";
+
+      for await (const chunk of upstream.body) {
+        body += chunk.toString("utf8");
+      }
+
+      const baseUrl = new URL(target);
+
+      /*
+       * Rewrite common relative resource URLs so that images,
+       * stylesheets and scripts continue to work through Zenith.
+       */
+      body = body.replace(
+        /(src|href|action)=("([^"]*)"|'([^']*)')/gi,
+        (match, attribute, quoted, doubleValue, singleValue) => {
+          const original = doubleValue ?? singleValue;
+
+          if (
+            !original ||
+            original.startsWith("#") ||
+            original.startsWith("data:") ||
+            original.startsWith("javascript:") ||
+            original.startsWith("mailto:")
+          ) {
+            return match;
+          }
+
+          const absolute = rewriteUrl(original, baseUrl.href);
+
+          if (!/^https?:\/\//i.test(absolute)) {
+            return match;
+          }
+
+          const proxyUrl =
+            "/proxy?url=" + encodeURIComponent(absolute);
+
+          const quote = quoted[0];
+
+          return `${attribute}=${quote}${proxyUrl}${quote}`;
+        }
+      );
+
+      res.send(body);
+      return;
+    }
+
+    /*
+     * Everything else — images, CSS, JavaScript, fonts,
+     * JSON, media, etc. — is streamed directly.
+     */
+    upstream.body.pipe(res);
 
   } catch (error) {
-    console.error("Proxy error:", error);
+    console.error("Zenith proxy error:", error);
 
     if (!res.headersSent) {
       res.status(502).json({
-        error: "Unable to reach the requested website."
+        error: "Unable to reach the requested website.",
+        details: error.message
       });
     } else {
       res.end();
