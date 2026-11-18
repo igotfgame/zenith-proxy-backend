@@ -1,38 +1,147 @@
-// server.js
-// Zenith Fast Proxy
-// Node.js 18+
+import http from "node:http";
+import path from "node:path";
+import { fileURLToPath, createRequire } from "node:module";
 
-const express = require("express");
-const { request } = require("undici");
+import express from "express";
+import { server as wisp } from "@mercuryworkshop/wisp-js/server";
+import { scramjetPath } from "@mercuryworkshop/scramjet/path";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const require = createRequire(import.meta.url);
 
 const app = express();
+const PORT = Number(process.env.PORT) || 3000;
 
-const PORT = process.env.PORT || 3000;
+function dirOf(specifier) {
+  return path.dirname(require.resolve(specifier));
+}
 
-// Domains Zenith is allowed to proxy.
-// Add more domains here as needed.
-const ALLOWED_HOSTS = [
-  "duckduckgo.com",
-  "www.duckduckgo.com"
-];
+/*
+ * Cross-origin isolation is required by Scramjet for sites
+ * that use features such as SharedArrayBuffer.
+ */
+app.use((req, res, next) => {
+  res.setHeader(
+    "Cross-Origin-Opener-Policy",
+    "same-origin"
+  );
 
-function isAllowed(url) {
+  res.setHeader(
+    "Cross-Origin-Embedder-Policy",
+    "require-corp"
+  );
+
+  next();
+});
+
+/*
+ * Scramjet core + WASM
+ */
+app.use(
+  "/scram/",
+  express.static(scramjetPath)
+);
+
+/*
+ * Scramjet utilities
+ */
+app.use(
+  "/utils/",
+  express.static(
+    dirOf("@mercuryworkshop/scramjet-utils")
+  )
+);
+
+/*
+ * Scramjet controller
+ */
+app.use(
+  "/controller/",
+  express.static(
+    dirOf("@mercuryworkshop/scramjet-controller")
+  )
+);
+
+/*
+ * Libcurl transport
+ */
+app.use(
+  "/libcurl/",
+  express.static(
+    dirOf("@mercuryworkshop/libcurl-transport")
+  )
+);
+
+/*
+ * Zenith frontend
+ */
+app.use(
+  express.static(
+    path.join(__dirname, "public")
+  )
+);
+
+/*
+ * Health endpoint
+ */
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    service: "zenith-scramjet",
+    uptime: process.uptime()
+  });
+});
+
+/*
+ * Wisp WebSocket transport.
+ *
+ * This is the actual transport used by the
+ * Scramjet browser engine.
+ */
+wisp.options.allow_private_ips = false;
+wisp.options.allow_loopback_ips = false;
+
+const server = http.createServer(app);
+
+server.on("upgrade", (req, socket, head) => {
+  let pathname;
+
   try {
-    const parsed = new URL(url);
+    pathname = new URL(
+      req.url || "/",
+      "http://localhost"
+    ).pathname;
+  } catch {
+    socket.end();
+    return;
+  }
 
-    if (!["http:", "https:"].includes(parsed.protocol)) {
-      return false;
+  if (pathname === "/wisp/") {
+    req.url = "/wisp/";
+
+    try {
+      wisp.routeRequest(req, socket, head);
+    } catch (error) {
+      console.error("Wisp error:", error);
+      socket.end();
     }
 
-    return ALLOWED_HOSTS.some(
-      host =>
-        parsed.hostname === host ||
-        parsed.hostname.endsWith("." + host)
-    );
-  } catch {
-    return false;
+    return;
   }
-}
+
+  socket.end();
+});
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log("================================");
+  console.log(" Zenith Scramjet Proxy");
+  console.log("================================");
+  console.log(`HTTP:  http://0.0.0.0:${PORT}`);
+  console.log(`Wisp:  ws://0.0.0.0:${PORT}/wisp/`);
+  console.log("Status: ONLINE");
+});
 
 app.get("/", (req, res) => {
   res.json({
