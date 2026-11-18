@@ -1,75 +1,42 @@
+// server.js
+// Zenith Fast Proxy
+// Node.js 18+
+
 const express = require("express");
-const dns = require("dns").promises;
-const net = require("net");
+const { request } = require("undici");
 
 const app = express();
-const PORT = process.env.PORT || 8080;
 
-// Basic CORS so your Google Apps Script frontend can call the API.
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+const PORT = process.env.PORT || 3000;
 
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(204);
-  }
+// Domains Zenith is allowed to proxy.
+// Add more domains here as needed.
+const ALLOWED_HOSTS = [
+  "duckduckgo.com",
+  "www.duckduckgo.com"
+];
 
-  next();
-});
+function isAllowed(url) {
+  try {
+    const parsed = new URL(url);
 
-function isPrivateIp(ip) {
-  if (net.isIPv4(ip)) {
-    const parts = ip.split(".").map(Number);
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      return false;
+    }
 
-    return (
-      parts[0] === 10 ||
-      parts[0] === 127 ||
-      (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
-      (parts[0] === 192 && parts[1] === 168) ||
-      parts[0] === 0
+    return ALLOWED_HOSTS.some(
+      host =>
+        parsed.hostname === host ||
+        parsed.hostname.endsWith("." + host)
     );
-  }
-
-  if (net.isIPv6(ip)) {
-    const normalized = ip.toLowerCase();
-
-    return (
-      normalized === "::1" ||
-      normalized === "::" ||
-      normalized.startsWith("fc") ||
-      normalized.startsWith("fd") ||
-      normalized.startsWith("fe80:")
-    );
-  }
-
-  return true;
-}
-
-async function isSafeTarget(url) {
-  if (!["http:", "https:"].includes(url.protocol)) {
+  } catch {
     return false;
   }
-
-  const hostname = url.hostname;
-
-  // Don't allow localhost-style names.
-  if (
-    hostname === "localhost" ||
-    hostname.endsWith(".localhost") ||
-    hostname.endsWith(".local")
-  ) {
-    return false;
-  }
-
-  const addresses = await dns.lookup(hostname, { all: true });
-
-  return addresses.every(({ address }) => !isPrivateIp(address));
 }
 
 app.get("/", (req, res) => {
   res.json({
-    name: "Zenith Proxy Backend",
+    name: "Zenith Proxy",
     status: "online",
     version: "1.0.0"
   });
@@ -77,59 +44,72 @@ app.get("/", (req, res) => {
 
 app.get("/health", (req, res) => {
   res.json({
-    status: "ok"
+    status: "ok",
+    uptime: process.uptime()
   });
 });
 
 app.get("/proxy", async (req, res) => {
+  const target = req.query.url;
+
+  if (!target) {
+    return res.status(400).json({
+      error: "Missing url parameter"
+    });
+  }
+
+  if (!isAllowed(target)) {
+    return res.status(403).json({
+      error: "This domain is not allowed by the Zenith proxy."
+    });
+  }
+
   try {
-    const target = req.query.url;
+    const response = await request(target, {
+      method: "GET",
 
-    if (!target) {
-      return res.status(400).json({
-        error: "Missing url parameter"
-      });
-    }
-
-    let targetUrl;
-
-    try {
-      targetUrl = new URL(target);
-    } catch {
-      return res.status(400).json({
-        error: "Invalid URL"
-      });
-    }
-
-    if (!(await isSafeTarget(targetUrl))) {
-      return res.status(403).json({
-        error: "Target URL is not allowed"
-      });
-    }
-
-    const response = await fetch(targetUrl, {
-      redirect: "follow",
       headers: {
-        "User-Agent": "ZenithProxy/1.0"
-      }
+        "user-agent":
+          "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/156 Safari/537.36",
+        "accept":
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": "en-US,en;q=0.9"
+      },
+
+      maxRedirections: 5,
+
+      headersTimeout: 10000,
+      bodyTimeout: 30000
     });
 
-    const contentType = response.headers.get("content-type") || "";
+    res.status(response.statusCode);
 
-    res.status(response.status);
-    res.setHeader("Content-Type", contentType);
+    const contentType = response.headers["content-type"];
 
-    const body = await response.arrayBuffer();
-    res.send(Buffer.from(body));
+    if (contentType) {
+      res.setHeader("content-type", contentType);
+    }
+
+    // Don't let the upstream connection hang around unnecessarily.
+    res.setHeader("cache-control", "no-store");
+
+    // Stream the response directly to the browser.
+    // This is much faster than buffering the entire page.
+    response.body.pipe(res);
+
   } catch (error) {
     console.error("Proxy error:", error);
 
-    res.status(502).json({
-      error: "Unable to retrieve the requested website"
-    });
+    if (!res.headersSent) {
+      res.status(502).json({
+        error: "Unable to reach the requested website."
+      });
+    } else {
+      res.end();
+    }
   }
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Zenith Proxy Backend running on port ${PORT}`);
-});
+  console.log(`Zenith Proxy running on port ${PORT}`);
+});;
