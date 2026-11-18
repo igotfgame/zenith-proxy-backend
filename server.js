@@ -1,3 +1,4 @@
+```javascript
 import express from "express";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,14 +9,10 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-// ------------------------------------------------------------
-// Basic settings
-// ------------------------------------------------------------
-
 app.disable("x-powered-by");
 
-app.use(express.json({ limit: "1mb" }));
-app.use(express.urlencoded({ extended: true, limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true, limit: "2mb" }));
 
 // ------------------------------------------------------------
 // CORS
@@ -48,13 +45,14 @@ const publicPath = path.join(__dirname, "public");
 app.use(express.static(publicPath));
 
 // ------------------------------------------------------------
-// Health checks
+// Health
 // ------------------------------------------------------------
 
 app.get("/health", (req, res) => {
   res.status(200).json({
     status: "ok",
     service: "zenith-proxy-backend",
+    version: "4.0.0",
     uptime: process.uptime()
   });
 });
@@ -63,15 +61,11 @@ app.get("/healthz", (req, res) => {
   res.status(200).send("OK");
 });
 
-// ------------------------------------------------------------
-// API status
-// ------------------------------------------------------------
-
 app.get("/api/status", (req, res) => {
   res.status(200).json({
     name: "Zenith Proxy",
     status: "online",
-    version: "3.0.0",
+    version: "4.0.0",
     uptime: process.uptime()
   });
 });
@@ -84,13 +78,16 @@ app.get("/", (req, res) => {
   res.status(200).json({
     name: "Zenith Proxy",
     status: "online",
-    version: "3.0.0",
-    health: "/health"
+    version: "4.0.0",
+    endpoints: {
+      health: "/health",
+      proxy: "/proxy?url=https://example.com"
+    }
   });
 });
 
 // ------------------------------------------------------------
-// Simple URL proxy
+// Target validation
 // ------------------------------------------------------------
 
 const BLOCKED_HOSTS = new Set([
@@ -124,11 +121,50 @@ function isSafeTarget(target) {
 }
 
 // ------------------------------------------------------------
-// Proxy endpoint
+// Rewrite HTML so relative links work through the proxy
+// ------------------------------------------------------------
+
+function rewriteHtml(html, targetUrl) {
+  try {
+    const base = new URL(targetUrl);
+
+    // Make relative links absolute.
+    html = html.replace(
+      /(\s(?:href|src|action)=["'])(?!https?:|data:|javascript:|#|mailto:|tel:|\/{2})/gi,
+      `$1${base.origin}/`
+    );
+
+    // Convert root-relative URLs into absolute URLs.
+    html = html.replace(
+      /(\s(?:href|src|action)=["'])\/(?!\/)/gi,
+      `$1${base.origin}/`
+    );
+
+    // Remove frame restrictions from HTML.
+    html = html.replace(
+      /<meta[^>]+http-equiv=["']?Content-Security-Policy["']?[^>]*>/gi,
+      ""
+    );
+
+    html = html.replace(
+      /<meta[^>]+http-equiv=["']?X-Frame-Options["']?[^>]*>/gi,
+      ""
+    );
+
+    return html;
+  } catch {
+    return html;
+  }
+}
+
+// ------------------------------------------------------------
+// Proxy
 // ------------------------------------------------------------
 
 app.get("/proxy", async (req, res) => {
-  const target = String(req.query.url || "").trim();
+  const target = String(
+    req.query.url || ""
+  ).trim();
 
   if (!target) {
     return res.status(400).json({
@@ -142,75 +178,134 @@ app.get("/proxy", async (req, res) => {
     });
   }
 
+  console.log(
+    `[PROXY] ${target}`
+  );
+
   try {
     const response = await fetch(target, {
       method: "GET",
       redirect: "follow",
+
       headers: {
         "User-Agent":
-          "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/156 Safari/537.36",
+          "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/156.0 Safari/537.36",
 
         "Accept":
           "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
 
         "Accept-Language":
-          "en-US,en;q=0.9"
+          "en-US,en;q=0.9",
+
+        "Cache-Control":
+          "no-cache"
       }
     });
 
-    res.status(response.status);
+    const finalUrl =
+      response.url || target;
 
     const contentType =
-      response.headers.get("content-type") || "";
+      response.headers.get(
+        "content-type"
+      ) || "text/plain";
 
-    if (contentType) {
-      res.setHeader(
-        "Content-Type",
-        contentType
-      );
-    }
+    res.status(
+      response.status
+    );
 
-    const cacheControl =
-      response.headers.get("cache-control");
+    res.setHeader(
+      "Content-Type",
+      contentType
+    );
 
-    if (cacheControl) {
-      res.setHeader(
-        "Cache-Control",
-        cacheControl
-      );
-    }
+    res.setHeader(
+      "Access-Control-Allow-Origin",
+      "*"
+    );
 
-    // Remove headers that commonly prevent
-    // proxied content from being displayed.
+    // Don't pass these headers through.
     res.removeHeader(
       "Content-Security-Policy"
+    );
+
+    res.removeHeader(
+      "Content-Security-Policy-Report-Only"
     );
 
     res.removeHeader(
       "X-Frame-Options"
     );
 
-    const body = await response.arrayBuffer();
+    res.removeHeader(
+      "Frame-Options"
+    );
 
-    res.send(Buffer.from(body));
+    res.removeHeader(
+      "Cross-Origin-Opener-Policy"
+    );
+
+    res.removeHeader(
+      "Cross-Origin-Embedder-Policy"
+    );
+
+    res.removeHeader(
+      "Cross-Origin-Resource-Policy"
+    );
+
+    const body =
+      await response.arrayBuffer();
+
+    let buffer =
+      Buffer.from(body);
+
+    // --------------------------------------------------------
+    // HTML rewriting
+    // --------------------------------------------------------
+
+    if (
+      contentType
+        .toLowerCase()
+        .includes("text/html")
+    ) {
+      let html =
+        buffer.toString("utf8");
+
+      html =
+        rewriteHtml(
+          html,
+          finalUrl
+        );
+
+      buffer =
+        Buffer.from(
+          html,
+          "utf8"
+        );
+    }
+
+    res.send(buffer);
 
   } catch (error) {
+
     console.error(
-      "Zenith proxy error:",
+      "[PROXY ERROR]",
       error
     );
 
     if (!res.headersSent) {
       res.status(502).json({
         error:
-          "Unable to reach the requested website."
+          "Zenith could not reach the requested website.",
+        details:
+          String(error?.message || error)
       });
     }
   }
 });
 
 // ------------------------------------------------------------
-// 404 handler
+// 404
 // ------------------------------------------------------------
 
 app.use((req, res) => {
@@ -224,75 +319,92 @@ app.use((req, res) => {
 // Error handler
 // ------------------------------------------------------------
 
-app.use((error, req, res, next) => {
-  console.error(
-    "Zenith server error:",
-    error
-  );
+app.use(
+  (error, req, res, next) => {
 
-  if (res.headersSent) {
-    return next(error);
-  }
-
-  res.status(500).json({
-    error: "Internal server error"
-  });
-});
-
-// ------------------------------------------------------------
-// Start server
-// ------------------------------------------------------------
-
-const server = app.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
-    console.log(
-      "================================"
+    console.error(
+      "[SERVER ERROR]",
+      error
     );
 
-    console.log(
-      " Zenith Proxy Backend"
-    );
+    if (res.headersSent) {
+      return next(error);
+    }
 
-    console.log(
-      "================================"
-    );
-
-    console.log(
-      `Server listening on port ${PORT}`
-    );
-
-    console.log(
-      `Health: http://0.0.0.0:${PORT}/health`
-    );
-
-    console.log(
-      "Status: ONLINE"
-    );
+    res.status(500).json({
+      error:
+        "Internal server error"
+    });
   }
 );
 
 // ------------------------------------------------------------
-// Graceful shutdown
+// Start
+// ------------------------------------------------------------
+
+const server =
+  app.listen(
+    PORT,
+    "0.0.0.0",
+    () => {
+
+      console.log(
+        "================================"
+      );
+
+      console.log(
+        "       ZENITH PROXY BACKEND"
+      );
+
+      console.log(
+        "================================"
+      );
+
+      console.log(
+        `Server listening on port ${PORT}`
+      );
+
+      console.log(
+        `Health endpoint: /health`
+      );
+
+      console.log(
+        `Proxy endpoint: /proxy?url=...`
+      );
+
+      console.log(
+        "Status: ONLINE"
+      );
+    }
+  );
+
+// ------------------------------------------------------------
+// Shutdown
 // ------------------------------------------------------------
 
 function shutdown(signal) {
+
   console.log(
     `${signal} received. Shutting down...`
   );
 
-  server.close(() => {
-    console.log(
-      "Zenith server stopped."
-    );
+  server.close(
+    () => {
 
-    process.exit(0);
-  });
+      console.log(
+        "Zenith server stopped."
+      );
 
-  setTimeout(() => {
-    process.exit(1);
-  }, 10000);
+      process.exit(0);
+    }
+  );
+
+  setTimeout(
+    () => {
+      process.exit(1);
+    },
+    10000
+  );
 }
 
 process.on(
@@ -304,3 +416,4 @@ process.on(
   "SIGINT",
   () => shutdown("SIGINT")
 );
+```
