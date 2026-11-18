@@ -1,369 +1,629 @@
-import http from "node:http";
-import path from "node:path";
-import { fileURLToPath, createRequire } from "node:module";
-
 import express from "express";
-import { server as wisp } from "@mercuryworkshop/wisp-js/server";
-import { scramjetPath } from "@mercuryworkshop/scramjet/path";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { request } from "undici";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const require = createRequire(import.meta.url);
-
 const app = express();
-const PORT = Number(process.env.PORT) || 3000;
-
-function dirOf(specifier) {
-  return path.dirname(require.resolve(specifier));
-}
 
 /*
- * Cross-origin isolation is required by Scramjet for sites
- * that use features such as SharedArrayBuffer.
+ * EthioDeploy provides the PORT environment variable.
+ * Never hard-code the production port.
  */
+const PORT = Number(process.env.PORT) || 3000;
+
+/*
+ * ============================================================
+ * BASIC SECURITY / CORS
+ * ============================================================
+ */
+
+app.disable("x-powered-by");
+
 app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader(
-    "Cross-Origin-Opener-Policy",
-    "same-origin"
+    "Access-Control-Allow-Methods",
+    "GET, POST, OPTIONS"
+  );
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type"
   );
 
-  res.setHeader(
-    "Cross-Origin-Embedder-Policy",
-    "require-corp"
-  );
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
 
   next();
 });
 
-/*
- * Scramjet core + WASM
- */
-app.use(
-  "/scram/",
-  express.static(scramjetPath)
-);
 
 /*
- * Scramjet utilities
+ * ============================================================
+ * FRONTEND
+ * ============================================================
  */
-app.use(
-  "/utils/",
-  express.static(
-    dirOf("@mercuryworkshop/scramjet-utils")
-  )
-);
 
-/*
- * Scramjet controller
- */
-app.use(
-  "/controller/",
-  express.static(
-    dirOf("@mercuryworkshop/scramjet-controller")
-  )
-);
-
-/*
- * Libcurl transport
- */
-app.use(
-  "/libcurl/",
-  express.static(
-    dirOf("@mercuryworkshop/libcurl-transport")
-  )
-);
-
-/*
- * Zenith frontend
- */
 app.use(
   express.static(
     path.join(__dirname, "public")
   )
 );
 
-/*
- * Health endpoint
- */
-app.get("/health", (req, res) => {
-  res.json({
-    status: "ok",
-    service: "zenith-scramjet",
-    uptime: process.uptime()
-  });
-});
 
 /*
- * Wisp WebSocket transport.
- *
- * This is the actual transport used by the
- * Scramjet browser engine.
+ * ============================================================
+ * ROOT
+ * ============================================================
  */
-wisp.options.allow_private_ips = false;
-wisp.options.allow_loopback_ips = false;
-
-const server = http.createServer(app);
-
-server.on("upgrade", (req, socket, head) => {
-  let pathname;
-
-  try {
-    pathname = new URL(
-      req.url || "/",
-      "http://localhost"
-    ).pathname;
-  } catch {
-    socket.end();
-    return;
-  }
-
-  if (pathname === "/wisp/") {
-    req.url = "/wisp/";
-
-    try {
-      wisp.routeRequest(req, socket, head);
-    } catch (error) {
-      console.error("Wisp error:", error);
-      socket.end();
-    }
-
-    return;
-  }
-
-  socket.end();
-});
-
-server.listen(PORT, "0.0.0.0", () => {
-  console.log("================================");
-  console.log(" Zenith Scramjet Proxy");
-  console.log("================================");
-  console.log(`HTTP:  http://0.0.0.0:${PORT}`);
-  console.log(`Wisp:  ws://0.0.0.0:${PORT}/wisp/`);
-  console.log("Status: ONLINE");
-});
 
 app.get("/", (req, res) => {
-  res.json({
+  res.status(200).json({
     name: "Zenith Proxy",
     status: "online",
-    version: "1.0.0"
+    version: "3.0.0"
   });
 });
 
-const express = require("express");
-const { request } = require("undici");
-const path = require("path");
 
-const app = express();
-const PORT = process.env.PORT || 3000;
+/*
+ * ============================================================
+ * HEALTH CHECKS
+ * ============================================================
+ *
+ * Keep several common health endpoints so the deployment
+ * platform can successfully detect the server.
+ */
 
-app.use(express.static(path.join(__dirname, "public")));
+function healthResponse(req, res) {
+  res.status(200).json({
+    status: "ok",
+    service: "zenith-proxy",
+    version: "3.0.0",
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString()
+  });
+}
+
+app.get("/health", healthResponse);
+app.get("/healthz", healthResponse);
+app.get("/api/health", healthResponse);
+
+
+/*
+ * ============================================================
+ * PROXY CONFIGURATION
+ * ============================================================
+ */
 
 const BLOCKED_HOSTS = new Set([
   "localhost",
   "127.0.0.1",
   "0.0.0.0",
-  "::1"
+  "::1",
+  "[::1]"
 ]);
+
+
+function isPrivateIPv4(hostname) {
+  const parts = hostname.split(".").map(Number);
+
+  if (
+    parts.length !== 4 ||
+    parts.some(Number.isNaN)
+  ) {
+    return false;
+  }
+
+  const [a, b] = parts;
+
+  if (a === 10) return true;
+
+  if (
+    a === 172 &&
+    b >= 16 &&
+    b <= 31
+  ) {
+    return true;
+  }
+
+  if (
+    a === 192 &&
+    b === 168
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
 
 function isSafeTarget(target) {
   try {
     const url = new URL(target);
 
-    if (!["http:", "https:"].includes(url.protocol)) {
+    if (
+      url.protocol !== "http:" &&
+      url.protocol !== "https:"
+    ) {
       return false;
     }
 
-    if (BLOCKED_HOSTS.has(url.hostname.toLowerCase())) {
+    const hostname =
+      url.hostname.toLowerCase();
+
+    if (
+      BLOCKED_HOSTS.has(hostname)
+    ) {
+      return false;
+    }
+
+    if (
+      hostname === "metadata.google.internal" ||
+      hostname.endsWith(".internal")
+    ) {
+      return false;
+    }
+
+    if (isPrivateIPv4(hostname)) {
       return false;
     }
 
     return true;
+
   } catch {
     return false;
   }
 }
 
-function rewriteUrl(url, base) {
+
+/*
+ * ============================================================
+ * URL REWRITING
+ * ============================================================
+ */
+
+function makeAbsoluteUrl(value, base) {
   try {
-    return new URL(url, base).href;
+    return new URL(
+      value,
+      base
+    ).href;
   } catch {
-    return url;
+    return null;
   }
 }
 
-app.get("/", (req, res) => {
-  res.json({
-    name: "Zenith Proxy",
-    status: "online",
-    version: "2.0.0"
-  });
-});
 
-app.get("/health", (req, res) => {
-  res.json({
-    status: "ok",
-    uptime: process.uptime()
-  });
-});
+function proxyUrl(url) {
+  return (
+    "/proxy?url=" +
+    encodeURIComponent(url)
+  );
+}
+
+
+/*
+ * Rewrite common HTML URLs.
+ *
+ * This is intentionally conservative. It handles the common
+ * src/href/action attributes without trying to rewrite every
+ * possible JavaScript string.
+ */
+
+function rewriteHtml(body, target) {
+
+  const base =
+    new URL(target).href;
+
+  return body.replace(
+    /(src|href|action)\s*=\s*(["'])(.*?)\2/gi,
+
+    (match, attribute, quote, value) => {
+
+      const original =
+        String(value || "").trim();
+
+      if (!original) {
+        return match;
+      }
+
+      if (
+        original.startsWith("#") ||
+        original.startsWith("data:") ||
+        original.startsWith("blob:") ||
+        original.startsWith("javascript:") ||
+        original.startsWith("mailto:") ||
+        original.startsWith("tel:")
+      ) {
+        return match;
+      }
+
+      const absolute =
+        makeAbsoluteUrl(
+          original,
+          base
+        );
+
+      if (!absolute) {
+        return match;
+      }
+
+      if (
+        !/^https?:\/\//i.test(
+          absolute
+        )
+      ) {
+        return match;
+      }
+
+      return (
+        attribute +
+        "=" +
+        quote +
+        proxyUrl(absolute) +
+        quote
+      );
+    }
+  );
+}
+
+
+/*
+ * ============================================================
+ * PROXY
+ * ============================================================
+ */
 
 app.get("/proxy", async (req, res) => {
-  const target = req.query.url;
+
+  const target =
+    String(req.query.url || "").trim();
 
   if (!target) {
+
     return res.status(400).json({
-      error: "Missing url parameter"
+      error: "Missing url parameter."
     });
   }
+
 
   if (!isSafeTarget(target)) {
+
     return res.status(400).json({
-      error: "Invalid target URL"
+      error: "Invalid target URL."
     });
   }
 
+
   try {
-    const upstream = await request(target, {
-      method: "GET",
 
-      headers: {
-        "user-agent":
-          "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/156 Safari/537.36",
+    console.log(
+      "[PROXY]",
+      target
+    );
 
-        "accept":
-          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
 
-        "accept-language": "en-US,en;q=0.9",
+    const upstream =
+      await request(
+        target,
+        {
+          method: "GET",
 
-        "accept-encoding": "identity"
-      },
+          headers: {
+            "user-agent":
+              "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/156 Safari/537.36",
 
-      maxRedirections: 5,
+            "accept":
+              "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
 
-      headersTimeout: 15000,
-      bodyTimeout: 60000
-    });
+            "accept-language":
+              "en-US,en;q=0.9",
 
-    res.status(upstream.statusCode);
+            "accept-encoding":
+              "identity"
+          },
 
-    const headers = upstream.headers;
+          maxRedirections: 5,
+
+          headersTimeout: 15000,
+
+          bodyTimeout: 60000
+        }
+      );
+
+
+    res.status(
+      upstream.statusCode
+    );
+
 
     /*
-     * Forward useful response headers.
+     * Forward useful headers.
      */
+
+    const headers =
+      upstream.headers;
+
     const allowedHeaders = [
       "content-type",
       "content-length",
-      "content-encoding",
-      "last-modified",
-      "etag",
       "cache-control",
+      "etag",
+      "last-modified",
       "expires",
       "date"
     ];
 
-    for (const header of allowedHeaders) {
-      if (headers[header]) {
-        res.setHeader(header, headers[header]);
+
+    for (
+      const header of allowedHeaders
+    ) {
+
+      if (
+        headers[header] !== undefined
+      ) {
+
+        res.setHeader(
+          header,
+          headers[header]
+        );
       }
     }
 
-    /*
-     * Prevent the browser from trying to download pages
-     * because of upstream headers.
-     */
-    res.removeHeader("content-security-policy");
-    res.removeHeader("content-security-policy-report-only");
-    res.removeHeader("x-frame-options");
-
-    const contentType = String(headers["content-type"] || "");
 
     /*
-     * HTML gets streamed through directly.
-     *
-     * Images, CSS, JS, fonts, video, etc. are also streamed
-     * without buffering the entire response in memory.
+     * Prevent the upstream website from preventing
+     * itself from being displayed inside our browser.
      */
+
+    res.removeHeader(
+      "content-security-policy"
+    );
+
+    res.removeHeader(
+      "content-security-policy-report-only"
+    );
+
+    res.removeHeader(
+      "x-frame-options"
+    );
+
+
+    const contentType =
+      String(
+        headers["content-type"] || ""
+      ).toLowerCase();
+
+
+    /*
+     * HTML / XHTML
+     */
+
     if (
-      contentType.includes("text/html") ||
-      contentType.includes("application/xhtml+xml")
+      contentType.includes(
+        "text/html"
+      ) ||
+      contentType.includes(
+        "application/xhtml+xml"
+      )
     ) {
+
       let body = "";
 
-      for await (const chunk of upstream.body) {
-        body += chunk.toString("utf8");
+      for await (
+        const chunk of upstream.body
+      ) {
+
+        body +=
+          Buffer
+            .from(chunk)
+            .toString("utf8");
       }
 
-      const baseUrl = new URL(target);
+
+      body =
+        rewriteHtml(
+          body,
+          target
+        );
+
 
       /*
-       * Rewrite common relative resource URLs so that images,
-       * stylesheets and scripts continue to work through Zenith.
+       * Prevent the original page from trying to
+       * navigate the top-level Zenith page.
        */
-      body = body.replace(
-        /(src|href|action)=("([^"]*)"|'([^']*)')/gi,
-        (match, attribute, quoted, doubleValue, singleValue) => {
-          const original = doubleValue ?? singleValue;
 
-          if (
-            !original ||
-            original.startsWith("#") ||
-            original.startsWith("data:") ||
-            original.startsWith("javascript:") ||
-            original.startsWith("mailto:")
-          ) {
-            return match;
-          }
+      body =
+        body.replace(
+          /<base\s+[^>]*>/gi,
+          ""
+        );
 
-          const absolute = rewriteUrl(original, baseUrl.href);
-
-          if (!/^https?:\/\//i.test(absolute)) {
-            return match;
-          }
-
-          const proxyUrl =
-            "/proxy?url=" + encodeURIComponent(absolute);
-
-          const quote = quoted[0];
-
-          return `${attribute}=${quote}${proxyUrl}${quote}`;
-        }
-      );
 
       res.send(body);
+
       return;
     }
 
+
     /*
-     * Everything else — images, CSS, JavaScript, fonts,
-     * JSON, media, etc. — is streamed directly.
+     * Non-HTML content:
+     *
+     * Images
+     * CSS
+     * JavaScript
+     * JSON
+     * Fonts
+     * etc.
      */
+
     upstream.body.pipe(res);
 
   } catch (error) {
-    console.error("Zenith proxy error:", error);
+
+    console.error(
+      "[PROXY ERROR]",
+      error
+    );
+
 
     if (!res.headersSent) {
+
       res.status(502).json({
-        error: "Unable to reach the requested website.",
-        details: error.message
+        error:
+          "Unable to reach the requested website.",
+
+        message:
+          error?.message ||
+          "Unknown proxy error."
       });
+
     } else {
+
       res.end();
     }
   }
 });
-app.get("/healthz", (req, res) => {
-  res.status(200).send("OK");
+
+
+/*
+ * ============================================================
+ * 404 HANDLER
+ * ============================================================
+ */
+
+app.use((req, res) => {
+
+  res.status(404).json({
+    error: "Not found",
+    path: req.path
+  });
+
 });
 
-const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Zenith Proxy running on port ${PORT}`);
-});
+/*
+ * ============================================================
+ * ERROR HANDLER
+ * ============================================================
+ */
 
-app.get("/healthz", (req, res) => {
-  res.status(200).send("OK");
-});
+app.use(
+  (error, req, res, next) => {
+
+    console.error(
+      "[SERVER ERROR]",
+      error
+    );
+
+    if (res.headersSent) {
+      return next(error);
+    }
+
+    res.status(500).json({
+      error: "Internal server error."
+    });
+  }
+);
+
+
+/*
+ * ============================================================
+ * START SERVER
+ * ============================================================
+ *
+ * 0.0.0.0 is important for cloud deployment.
+ */
+
+const server =
+  app.listen(
+    PORT,
+    "0.0.0.0",
+    () => {
+
+      console.log(
+        "================================"
+      );
+
+      console.log(
+        " Zenith Proxy Backend"
+      );
+
+      console.log(
+        "================================"
+      );
+
+      console.log(
+        `Port: ${PORT}`
+      );
+
+      console.log(
+        "Host: 0.0.0.0"
+      );
+
+      console.log(
+        "Status: ONLINE"
+      );
+
+      console.log(
+        `Health: /health`
+      );
+
+      console.log(
+        `Proxy: /proxy?url=...`
+      );
+
+      console.log(
+        "================================"
+      );
+    }
+  );
+
+
+/*
+ * ============================================================
+ * GRACEFUL SHUTDOWN
+ * ============================================================
+ */
+
+function shutdown(signal) {
+
+  console.log(
+    `${signal} received. Shutting down...`
+  );
+
+  server.close(() => {
+
+    console.log(
+      "Server closed."
+    );
+
+    process.exit(0);
+  });
+
+
+  setTimeout(() => {
+
+    console.error(
+      "Forced shutdown."
+    );
+
+    process.exit(1);
+
+  }, 10000);
+}
+
+
+process.on(
+  "SIGTERM",
+  () => shutdown("SIGTERM")
+);
+
+process.on(
+  "SIGINT",
+  () => shutdown("SIGINT")
+);;
