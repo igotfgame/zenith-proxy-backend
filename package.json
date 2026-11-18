@@ -1,13 +1,17 @@
 {
-  "name": "zenith-proxy",
-  "version": "1.0.0",
+  "name": "zenith-proxy-backend",
+  "version": "2.0.0",
   "private": true,
-  "main": "server.js",
+  "type": "module",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^5.1.0",
-    "undici": "^7.16.0"
+    "@mercuryworkshop/scramjet": "2.0.67-alpha.2",
+    "@mercuryworkshop/scramjet-controller": "0.0.14",
+    "@mercuryworkshop/scramjet-utils": "0.0.3",
+    "@mercuryworkshop/libcurl-transport": "^2.0.5",
+    "@mercuryworkshop/wisp-js": "^0.4.1",
+    "express": "^5.1.0"
   }
 }
